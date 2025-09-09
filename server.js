@@ -1,0 +1,217 @@
+import express from 'express';
+import multer from 'multer';
+import path from 'path';
+import fs from 'fs/promises';
+import { existsSync, createWriteStream } from 'fs';
+import { nanoid } from 'nanoid';
+import { fileURLToPath } from 'url';
+import archiver from 'archiver';
+import { Worker } from 'worker_threads';
+import os from 'os';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// Static frontend
+app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.json());
+
+// Configure uploads to per-batch temp folders
+const storage = multer.diskStorage({
+  destination: function (req, file, cb) {
+    const batchId = req.batchId;
+    const batchDir = path.join(__dirname, 'tmp', batchId, 'uploads');
+    fs.mkdir(batchDir, { recursive: true }).then(() => cb(null, batchDir)).catch(cb);
+  },
+  filename: function (req, file, cb) {
+    cb(null, file.originalname);
+  }
+});
+
+const upload = multer({
+  storage,
+  limits: {
+    fileSize: 1024 * 1024 * 200 // 200MB per bestand (pas aan naar wens)
+  },
+  fileFilter: (req, file, cb) => {
+    const allowed = ['.jpg', '.jpeg', '.png', '.webp', '.dng', '.cr2', '.nef'];
+    const ext = path.extname(file.originalname).toLowerCase();
+    if (allowed.includes(ext)) cb(null, true); else cb(new Error('Niet-ondersteund bestandstype: ' + ext));
+  }
+});
+
+// In-memory batchstatus (kan naar Redis/DB als gewenst)
+const batches = new Map();
+
+function createBatch({ mode, dateText, eventText }) {
+  const id = nanoid();
+  const batch = {
+    id,
+    mode, // 'edit-watermark' | 'edit-only' | 'watermark-only'
+    dateText: dateText || '',
+    eventText: eventText || '',
+    createdAt: new Date().toISOString(),
+    total: 0,
+    processed: 0,
+    failed: 0,
+    status: 'uploading', // 'queued' | 'processing' | 'zipping' | 'done' | 'error'
+    files: [], // { name, status: 'queued'|'ok'|'failed', error? }
+    outDir: path.join(__dirname, 'tmp', id, 'out'),
+    zipPath: path.join(__dirname, 'tmp', `${id}.zip`)
+  };
+  batches.set(id, batch);
+  return batch;
+}
+
+// Middleware om batchId te zetten vóór Multer
+app.post('/api/upload', (req, res, next) => {
+  const { mode, dateText, eventText } = req.query; // eenvoudige query-params via fetch()
+
+  if (!mode || !['edit-watermark','edit-only','watermark-only'].includes(mode)) {
+    return res.status(400).json({ error: 'Ongeldige of ontbrekende mode.' });
+  }
+  if ((mode === 'edit-watermark' || mode === 'watermark-only') && (!dateText || !eventText)) {
+    return res.status(400).json({ error: 'Datum en Naam van het evenement zijn verplicht bij watermerk-opties.' });
+  }
+
+  const batch = createBatch({ mode, dateText, eventText });
+  req.batchId = batch.id;
+  res.setHeader('x-batch-id', batch.id);
+  next();
+}, upload.array('photos', 500), async (req, res) => {
+  const batch = batches.get(req.batchId);
+  if (!batch) return res.status(500).json({ error: 'Batch niet gevonden.' });
+
+  batch.files = req.files.map(f => ({ name: f.originalname, status: 'queued' }));
+  batch.total = batch.files.length;
+  batch.status = 'queued';
+
+  // Start achtergrondverwerking
+  processBatchInBackground(batch).catch(err => {
+    batch.status = 'error';
+    batch.error = String(err);
+  });
+
+  res.json({ batchId: batch.id, total: batch.total });
+});
+
+app.get('/api/status/:id', (req, res) => {
+  const batch = batches.get(req.params.id);
+  if (!batch) return res.status(404).json({ error: 'Onbekende batch.' });
+  res.json({
+    id: batch.id,
+    status: batch.status,
+    processed: batch.processed,
+    total: batch.total,
+    failed: batch.failed,
+    files: batch.files
+  });
+});
+
+app.get('/api/download/:id', async (req, res) => {
+  const batch = batches.get(req.params.id);
+  if (!batch) return res.status(404).json({ error: 'Onbekende batch.' });
+  if (batch.status !== 'done') return res.status(409).json({ error: 'Batch niet gereed voor download.' });
+
+  const zipPath = batch.zipPath;
+  if (!existsSync(zipPath)) return res.status(404).json({ error: 'ZIP niet gevonden.' });
+
+  res.download(zipPath, path.basename(zipPath));
+});
+
+app.listen(PORT, () => {
+  console.log(`Server draait op http://localhost:${PORT}`);
+});
+
+async function processBatchInBackground(batch) {
+  batch.status = 'processing';
+  const batchRoot = path.join(__dirname, 'tmp', batch.id);
+  const uploadsDir = path.join(batchRoot, 'uploads');
+  const outDir = batch.outDir;
+  await fs.mkdir(outDir, { recursive: true });
+
+  const files = await fs.readdir(uploadsDir);
+  const workerCount = Math.min(4, Math.max(1, (os.cpus()?.length || 2) - 1));
+  let idx = 0;
+
+  const runNext = () => new Promise(resolve => {
+    const runOne = async () => {
+      const filename = files[idx++];
+      if (!filename) return resolve();
+      const inputPath = path.join(uploadsDir, filename);
+      const outputPath = path.join(outDir, filename.replace(/\.(dng|cr2|nef)$/i, '.jpg'));
+
+      await runWorker({
+        inputPath,
+        outputPath,
+        mode: batch.mode,
+        dateText: batch.dateText,
+        eventText: batch.eventText,
+        logoPath: path.join(__dirname, 'public', 'logo.png')
+      }).then(() => {
+        batch.processed++;
+        const f = batch.files.find(x => x.name === filename);
+        if (f) f.status = 'ok';
+      }).catch(err => {
+        batch.failed++;
+        const f = batch.files.find(x => x.name === filename);
+        if (f) { f.status = 'failed'; f.error = String(err); }
+      });
+
+      await runOne();
+    };
+    runOne();
+  });
+
+  // Start N parallel workers (simple work-stealing)
+  await Promise.all(Array.from({ length: workerCount }, () => runNext()));
+
+  // Controleer of er outputbestanden zijn
+  const outFiles = await fs.readdir(outDir).catch(() => []);
+  if (!outFiles.length) {
+    batch.status = 'error';
+    batch.error = 'Er zijn geen bewerkte bestanden geproduceerd (mogelijk faalden alle items).';
+    return;
+  }
+
+  // ZIP
+  batch.status = 'zipping';
+  await zipDirectory(outDir, batch.zipPath);
+  batch.status = 'done';
+  // Optioneel: lijst outputs in status
+  batch.files = batch.files.map(f => {
+    if (f.status === 'ok') return f;
+    return f;
+  });
+}
+
+function runWorker(payload) {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(new URL('./worker.js', import.meta.url), { workerData: payload });
+    worker.on('message', (msg) => {
+      if (msg.type === 'done') resolve();
+      if (msg.type === 'error') reject(new Error(msg.error));
+    });
+    worker.on('error', reject);
+    worker.on('exit', (code) => {
+      if (code !== 0) reject(new Error(`Worker exited with code ${code}`));
+    });
+  });
+}
+
+function zipDirectory(srcDir, zipPath) {
+  return new Promise((resolve, reject) => {
+    const output = createWriteStream(zipPath);
+    const archive = archiver('zip', { zlib: { level: 9 } });
+
+    output.on('close', resolve);
+    archive.on('error', reject);
+
+    archive.pipe(output);
+    archive.directory(srcDir, false);
+    archive.finalize();
+  });
+}

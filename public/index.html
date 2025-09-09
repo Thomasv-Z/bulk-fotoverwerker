@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="nl">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Bulk Fotoverwerking</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <div class="container">
+    <h1>Foto Commissie Fotoverwerking</h1>
+
+    <form id="controls" onsubmit="return false;">
+      <fieldset>
+        <legend>Actie</legend>
+        <label><input type="radio" name="mode" value="edit-watermark" checked> Bewerken &amp; Watermerk</label>
+        <label><input type="radio" name="mode" value="edit-only"> Alleen bewerken</label>
+        <label><input type="radio" name="mode" value="watermark-only"> Alleen watermerk</label>
+      </fieldset>
+
+      <div class="grid">
+        <label>Naam van het evenement
+          <input id="eventText" type="text" placeholder="Bijv. Zomers Festijn" required />
+        </label>
+        <label>Datum
+          <input id="dateText" type="text" placeholder="Bijv. 12-09-2025" required />
+        </label>
+      </div>
+
+      <div id="dropzone" class="dropzone">
+        <p>Sleep je foto’s hierheen of klik om te selecteren</p>
+        <input id="fileInput" type="file" multiple accept="image/jpeg,image/png,image/webp,.dng,.cr2,.nef" hidden />
+      </div>
+
+      <button id="goBtn" class="primary" disabled>Go</button>
+    </form>
+
+    <div id="status" class="status hidden"></div>
+  </div>
+
+  <script>
+    const dropzone = document.getElementById('dropzone');
+    const fileInput = document.getElementById('fileInput');
+    const goBtn = document.getElementById('goBtn');
+    const statusEl = document.getElementById('status');
+    const modeEls = Array.from(document.querySelectorAll('input[name="mode"]'));
+    const eventText = document.getElementById('eventText');
+    const dateText = document.getElementById('dateText');
+
+    let files = [];
+
+    function updateWatermarkRequirements() {
+      const mode = modeEls.find(r => r.checked)?.value;
+      const needsWM = (mode === 'edit-watermark' || mode === 'watermark-only');
+      eventText.required = needsWM;
+      dateText.required = needsWM;
+    }
+
+    modeEls.forEach(r => r.addEventListener('change', updateWatermarkRequirements));
+    updateWatermarkRequirements();
+
+    dropzone.addEventListener('click', () => fileInput.click());
+
+    ;['dragenter','dragover'].forEach(ev => dropzone.addEventListener(ev, e => {
+      e.preventDefault(); e.stopPropagation(); dropzone.classList.add('hover');
+    }));
+    ;['dragleave','drop'].forEach(ev => dropzone.addEventListener(ev, e => {
+      e.preventDefault(); e.stopPropagation(); dropzone.classList.remove('hover');
+    }));
+
+    dropzone.addEventListener('drop', (e) => {
+      files = Array.from(e.dataTransfer.files);
+      renderFileCount();
+    });
+    fileInput.addEventListener('change', (e) => {
+      files = Array.from(e.target.files);
+      renderFileCount();
+    });
+
+    function renderFileCount() {
+      const count = files.length;
+      dropzone.querySelector('p').textContent = count ? `${count} bestand(en) geselecteerd` : 'Sleep je foto’s hierheen of klik om te selecteren';
+      goBtn.disabled = count === 0;
+    }
+
+    goBtn.addEventListener('click', async () => {
+      const mode = modeEls.find(r => r.checked)?.value;
+      const needsWM = (mode === 'edit-watermark' || mode === 'watermark-only');
+      if (needsWM && (!eventText.value.trim() || !dateText.value.trim())) {
+        alert('Datum en Naam van het evenement zijn verplicht bij watermerk-opties.');
+        return;
+      }
+
+      const formData = new FormData();
+      files.forEach(f => formData.append('photos', f, f.name));
+
+      statusEl.classList.remove('hidden');
+      statusEl.textContent = 'Uploaden…';
+
+      const params = new URLSearchParams({ mode, eventText: eventText.value.trim(), dateText: dateText.value.trim() });
+      const resp = await fetch(`/api/upload?${params.toString()}`, { method: 'POST', body: formData });
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({}));
+        statusEl.textContent = 'Fout bij upload: ' + (err.error || resp.statusText);
+        return;
+      }
+      const data = await resp.json();
+      statusEl.textContent = `Batch ${data.batchId} geüpload. Verwerken…`;
+      pollStatus(data.batchId);
+    });
+
+    async function pollStatus(id) {
+      let done = false;
+      while (!done) {
+        const r = await fetch(`/api/status/${id}`);
+        const s = await r.json();
+        if (s.error) { statusEl.textContent = 'Fout: ' + s.error; return; }
+        statusEl.innerHTML = `
+          <div class="bar"><div class="bar-in" style="width:${(s.processed / s.total * 100 || 0).toFixed(1)}%"></div></div>
+          <p>Status: <strong>${s.status}</strong> – ${s.processed}/${s.total} gereed, ${s.failed} mislukt</p>
+        `;
+        if (s.status === 'done') {
+          done = true;
+          const a = document.createElement('a');
+          a.href = `/api/download/${id}`;
+          a.className = 'primary';
+          a.textContent = 'Download ZIP';
+          statusEl.appendChild(a);
+        } else if (s.status === 'error') {
+          done = true;
+          statusEl.innerHTML += '<p class="error">Batch mislukt.</p>';
+        }
+        await new Promise(res => setTimeout(res, 1000));
+      }
+    }
+  </script>
+</body>
+</html>
