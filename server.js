@@ -1,6 +1,7 @@
 import express from 'express';
 import multer from 'multer';
 import path from 'path';
+import { execFile } from 'child_process';
 import fs from 'fs/promises';
 import { existsSync, createWriteStream } from 'fs';
 import { nanoid } from 'nanoid';
@@ -13,7 +14,19 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
+
+// Ensure base directories exist
+fs.mkdir(ROOT_UPLOADS, { recursive: true }).catch(()=>{});
+fs.mkdir(ROOT_STORAGE, { recursive: true }).catch(()=>{});
+fs.mkdir(ROOT_TMP, { recursive: true }).catch(()=>{});
+
 const PORT = process.env.PORT || 3000;
+
+// Root directories (configurable via env)
+const ROOT_UPLOADS = process.env.UPLOADS_DIR || path.join(__dirname, 'uploads');
+const ROOT_STORAGE = process.env.STORAGE_DIR || path.join(__dirname, 'storage');
+const ROOT_TMP = process.env.TMP_DIR || path.join(__dirname, 'tmp');
+
 
 // Static frontend
 app.use(express.static(path.join(__dirname, 'public')));
@@ -23,7 +36,7 @@ app.use(express.json());
 const storage = multer.diskStorage({
   destination: function (req, file, cb) {
     const batchId = req.batchId;
-    const batchDir = path.join(__dirname, 'tmp', batchId, 'uploads');
+    const batchDir = path.join(ROOT_UPLOADS, batchId);
     fs.mkdir(batchDir, { recursive: true }).then(() => cb(null, batchDir)).catch(cb);
   },
   filename: function (req, file, cb) {
@@ -59,8 +72,8 @@ function createBatch({ mode, dateText, eventText }) {
     failed: 0,
     status: 'uploading', // 'queued' | 'processing' | 'zipping' | 'done' | 'error'
     files: [], // { name, status: 'queued'|'ok'|'failed', error? }
-    outDir: path.join(__dirname, 'tmp', id, 'out'),
-    zipPath: path.join(__dirname, 'tmp', `${id}.zip`)
+    outDir: path.join(ROOT_STORAGE, id, 'out'),
+    zipPath: path.join(ROOT_STORAGE, `${id}.zip`)
   };
   batches.set(id, batch);
   return batch;
@@ -128,8 +141,8 @@ app.listen(PORT, () => {
 
 async function processBatchInBackground(batch) {
   batch.status = 'processing';
-  const batchRoot = path.join(__dirname, 'tmp', batch.id);
-  const uploadsDir = path.join(batchRoot, 'uploads');
+  const batchRoot = path.join(ROOT_TMP, batch.id);
+  const uploadsDir = path.join(ROOT_UPLOADS, batch.id);
   const outDir = batch.outDir;
   await fs.mkdir(outDir, { recursive: true });
 
@@ -187,6 +200,60 @@ async function processBatchInBackground(batch) {
     return f;
   });
 }
+
+
+// --- RAW helper: convert proprietary RAW to TIFF/JPG using available tool ---
+const RAW_EXTS = ['.dng', '.arw', '.cr2', '.cr3', '.nef', '.orf', '.raf', '.rw2', '.srw'];
+const RASTER_OK = ['.jpg', '.jpeg', '.png', '.tif', '.tiff', '.webp', '.bmp'];
+
+function runExec(cmd, args) {
+  return new Promise((resolve, reject) => {
+    execFile(cmd, args, { windowsHide: true }, (err, stdout, stderr) => {
+      if (err) return reject(new Error(stderr?.toString() || err.message));
+      resolve(stdout?.toString() || '');
+    });
+  });
+}
+
+async function ensureRasterInput(inputPath) {
+  const ext = path.extname(inputPath).toLowerCase();
+  if (RASTER_OK.includes(ext)) return inputPath;
+  const isRAW = RAW_EXTS.includes(ext);
+  if (!isRAW) return inputPath;
+
+  const tmpOutDir = path.join(process.env.TMPDIR || os.tmpdir(), 'raw2tiff');
+  await fs.mkdir(tmpOutDir, { recursive: true });
+  const base = path.basename(inputPath, ext);
+  const outTif = path.join(tmpOutDir, base + '.tif');
+
+  // Try darktable-cli, then rawtherapee-cli, then dcraw_emu
+  const attempts = [
+    { cmd: 'darktable-cli', args: [inputPath, outTif, '--core', '--disable-opencl'] },
+    { cmd: 'rawtherapee-cli', args: ['-Y', '-o', outTif, '-c', inputPath] },
+    { cmd: 'dcraw_emu', args: ['-w', '-o', '1', '-T', '-6', '-c', inputPath], post: async(stdout)=>{
+        // dcraw_emu with -c writes to stdout; but many builds write file next to input; ensure outTif exists
+        if (!existsSync(outTif)) {
+          // try common sidecar name in same dir
+          const candidate = path.join(path.dirname(inputPath), base + '.tiff');
+          if (existsSync(candidate)) await fs.rename(candidate, outTif);
+        }
+      }
+    },
+  ];
+
+  for (const a of attempts) {
+    try {
+      await runExec(a.cmd, a.args);
+      if (a.post) await a.post();
+      if (existsSync(outTif)) return outTif;
+    } catch (e) {
+      // continue
+      if (process.env.LOG_LEVEL === 'debug') console.warn(`[RAW] ${a.cmd} failed: ${e.message}`);
+    }
+  }
+  throw new Error(`RAW-conversie mislukt voor ${path.basename(inputPath)} — geen bruikbare converter gevonden`);
+}
+
 
 function runWorker(payload) {
   return new Promise((resolve, reject) => {

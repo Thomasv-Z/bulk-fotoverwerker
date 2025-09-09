@@ -1,0 +1,27 @@
+services:
+  bulkfoto:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: bulkfoto:latest
+    container_name: bulkfoto
+    ports:
+      - "${PORT:-3000}:3000"
+    environment:
+      - NODE_ENV=${NODE_ENV:-production}
+      - PORT=3000
+      # Tweak worker count or concurrency if your app supports it
+      - MAX_WORKERS=${MAX_WORKERS:-4}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+    volumes:
+      # Persist user uploads and any temp/output your app writes
+      - ./uploads:/app/uploads
+      - ./storage:/app/storage
+    # Graceful stop
+    stop_signal: SIGINT
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:3000/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
